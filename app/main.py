@@ -69,6 +69,14 @@
   读自己收到的通知，但不能借此访问资料（通知不含正文/凭证/密钥）。失败或
   回滚的操作不留通知；扫描器与请求并发结算同一变化不重复投递（通知与状态
   变更同事务 + UNIQUE(recipient_id, event_seq) 兜底），已读重试不产生额外记录。
+- 账号持有人可凭当前 X-API-Key 轮换密钥（POST /me/api-key/rotate）：新密钥
+  只在成功响应中返回一次，库内只存 SHA-256 摘要；旧密钥自轮换事务提交起
+  失效（重启后仍然如此），再使用与无效凭据一样返回 401，不泄露账号存在性。
+  轮换与封存、见证同意、交接、清除安排等已认证写操作共用同一把写锁，按
+  事务提交先后判定：每个已认证写事务进入临界区后先复核“本次认证所用密钥
+  仍是当前密钥”（ensure_current_key）——轮换先提交则旧密钥的写操作以 401
+  拒绝并整体回滚（写入不生效、不留业务审计），业务写入先提交则照常完成。
+  未轮换账号与无凭据接口（阅览兑换、快照验真）行为不变。
 """
 import asyncio
 import base64
@@ -589,7 +597,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="双人见证资料封存服务",
-    version="1.8.0",
+    version="1.9.0",
     lifespan=lifespan,
 )
 
@@ -641,6 +649,23 @@ def err(status_code: int, message: str) -> HTTPException:
     return HTTPException(status_code=status_code, detail=message)
 
 
+def ensure_current_key(tx: sqlite3.Connection, user: sqlite3.Row) -> None:
+    """在写事务临界区内复核：本次认证所用密钥仍是该账号的当前密钥。
+
+    密钥轮换与封存、见证同意、交接、清除安排等已认证写操作共用同一把写锁
+    （BEGIN IMMEDIATE），并发时按事务提交先后判定：
+    - 轮换已先提交：users.key_hash 已变，本次持旧密钥的写操作在此以 401
+      拒绝并整体回滚——写入不生效，也不留业务审计；
+    - 本事务先进入临界区：轮换只能等本事务提交后再生效，业务写入照常完成。
+    拒绝文案与无效凭据一致（401 “凭据无效”），不泄露账号存在性。
+    """
+    row = tx.execute(
+        "SELECT key_hash FROM users WHERE id = ?", (user["id"],)
+    ).fetchone()
+    if row is None or row["key_hash"] != user["key_hash"]:
+        raise err(status.HTTP_401_UNAUTHORIZED, "凭据无效")
+
+
 # ---------------------------------------------------------------------------
 # 账号
 # ---------------------------------------------------------------------------
@@ -668,6 +693,41 @@ def me(user: sqlite3.Row = Depends(current_user)) -> dict[str, Any]:
     return {"user_id": user["id"], "username": user["username"]}
 
 
+@app.post("/me/api-key/rotate")
+def rotate_api_key(
+    db: sqlite3.Connection = Depends(get_db),
+    user: sqlite3.Row = Depends(current_user),
+) -> dict[str, Any]:
+    """账号持有人凭当前 X-API-Key 轮换密钥。
+
+    新密钥只在本响应中返回一次，库内只存 SHA-256 摘要；旧密钥自本次轮换
+    事务提交起失效（重启后仍然如此），再使用与无效凭据一样返回 401，
+    不泄露账号存在性。与其他已认证写操作按事务提交先后判定
+    （见 ensure_current_key）：并发重复轮换也只有先提交者生效。
+    """
+    new_key = secrets.token_hex(32)
+    now = utc_str(now_utc())
+    with write_tx(db) as tx:
+        # 锁内复核：若另一轮换已先提交，本次所持密钥已失效，按 401 拒绝并回滚
+        ensure_current_key(tx, user)
+        tx.execute(
+            "UPDATE users SET key_hash = ? WHERE id = ?",
+            (sha256_hex(new_key), user["id"]),
+        )
+        add_audit(
+            tx,
+            actor_id=user["id"],
+            action="api_key_rotated",
+            detail="账号轮换 API Key：新密钥仅本次响应返回，库内只存摘要；旧密钥自轮换提交起失效",
+        )
+    return {
+        "user_id": user["id"],
+        "username": user["username"],
+        "api_key": new_key,
+        "rotated_at": now,
+    }
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -690,6 +750,8 @@ def seal_document(
         raise err(400, "封存人不能同时担任见证人")
 
     with write_tx(db) as tx:
+        # 轮换先提交时旧密钥写入不得生效：锁内复核，失效则 401 并整体回滚
+        ensure_current_key(tx, user)
         placeholders = ",".join("?" for _ in payload.witnesses)
         witness_rows = tx.execute(
             f"SELECT id, username FROM users WHERE username IN ({placeholders})",
@@ -893,6 +955,8 @@ def create_open_request(
     post_commit_error: HTTPException | None = None
     request_id: int | None = None
     with write_tx(db) as tx:
+        # 轮换先提交时旧密钥写入不得生效：锁内复核，失效则 401 并整体回滚
+        ensure_current_key(tx, user)
         # 锁内先处理到点的定时开封与到期清除，避免与同意/撤销/扫描并发
         resolve_due_waiting(tx, now)
         purge_due_documents(tx, now)
@@ -988,6 +1052,8 @@ def approve_open_request(
     response: dict[str, Any] | None = None
     try:
         with write_tx(db) as tx:
+            # 轮换先提交时旧密钥写入不得生效：锁内复核，失效则 401 并整体回滚
+            ensure_current_key(tx, user)
             # 临界区第一步：到点的 waiting 请求必开封、到清除时刻的资料必清除；
             # 之后任何状态判定都以此为准，因此定时处理即使被后台延迟，
             # 也不会被并发同意/撤销/扫描作废。
@@ -1124,6 +1190,8 @@ def revoke_open_request(
     # 在提交后再返回。
     post_commit_error: HTTPException | None = None
     with write_tx(db) as tx:
+        # 轮换先提交时旧密钥写入不得生效：锁内复核，失效则 401 并整体回滚
+        ensure_current_key(tx, user)
         due_opened = resolve_due_waiting(tx, now, request_id) > 0
         purged_here = purge_due_documents(tx, now, meta["document_id"]) > 0
         req = tx.execute("SELECT * FROM open_requests WHERE id = ?", (request_id,)).fetchone()
@@ -1187,6 +1255,8 @@ def replace_witness(
     post_commit_error: HTTPException | None = None
     result: dict[str, Any] = {}
     with write_tx(db) as tx:
+        # 轮换先提交时旧密钥写入不得生效：锁内复核，失效则 401 并整体回滚
+        ensure_current_key(tx, user)
         # 临界区第一步与其他写路径一致：先确定性到点开封与到期清除。
         # 用全局解析：与扫描器等价，顺带把已到点的 waiting 请求开封、
         # 到清除时刻的资料清除。
@@ -1416,6 +1486,8 @@ def create_handover_invitation(
     invitation: dict[str, Any] | None = None
     try:
         with write_tx(db) as tx:
+            # 轮换先提交时旧密钥写入不得生效：锁内复核，失效则 401 并整体回滚
+            ensure_current_key(tx, user)
             # 临界区第一步与其他写路径一致：先确定性到点开封与到期清除
             # （开封/清除会连带使既有待确认邀请失效，必须先落库）。
             resolve_due_waiting(tx, now)
@@ -1517,6 +1589,8 @@ def revoke_handover_invitation(
     post_commit_error: HTTPException | None = None
     invitation: dict[str, Any] | None = None
     with write_tx(db) as tx:
+        # 轮换先提交时旧密钥写入不得生效：锁内复核，失效则 401 并整体回滚
+        ensure_current_key(tx, user)
         resolve_due_waiting(tx, now)
         purge_due_documents(tx, now)
         expired_here = expire_due_invitations(tx, now, invitation_id) > 0
@@ -1586,6 +1660,8 @@ def confirm_handover(
     post_commit_error: HTTPException | None = None
     response: dict[str, Any] | None = None
     with write_tx(db) as tx:
+        # 轮换先提交时旧密钥写入不得生效：锁内复核，失效则 401 并整体回滚
+        ensure_current_key(tx, user)
         # 结算顺序第 1 步：到点开封 / 到期清除 / 邀请逾期全部确定性落库。
         resolve_due_waiting(tx, now)
         purge_due_documents(tx, now)
@@ -1813,6 +1889,8 @@ def schedule_purge(
     post_commit_error: HTTPException | None = None
     result: dict[str, Any] | None = None
     with write_tx(db) as tx:
+        # 轮换先提交时旧密钥写入不得生效：锁内复核，失效则 401 并整体回滚
+        ensure_current_key(tx, user)
         # 临界区第一步与其他写路径一致：先确定性到点开封与到期清除。
         # 清除时刻已到的资料在此生效（purged），随后的改期请求随即被拒。
         resolve_due_waiting(tx, now)
@@ -1871,6 +1949,8 @@ def cancel_purge(
     post_commit_error: HTTPException | None = None
     result: dict[str, Any] | None = None
     with write_tx(db) as tx:
+        # 轮换先提交时旧密钥写入不得生效：锁内复核，失效则 401 并整体回滚
+        ensure_current_key(tx, user)
         # 与改期相同：先确定性到点开封与到期清除；清除时刻已到的资料在此
         # 生效，取消请求随即被拒（已到期不能取消）。
         resolve_due_waiting(tx, now)
@@ -1944,6 +2024,8 @@ def issue_view_pass(
     post_commit_error: HTTPException | None = None
     result: dict[str, Any] | None = None
     with write_tx(db) as tx:
+        # 轮换先提交时旧密钥写入不得生效：锁内复核，失效则 401 并整体回滚
+        ensure_current_key(tx, user)
         # 临界区第一步与其他写路径一致：先确定性到点开封，再结算到期清除，
         # 避免签发与定时开封/清除赛跑（同刻时清除优先由 resolve_due_waiting
         # 的 purge_at 比较保证；清除若在本临界区生效，先提交，再拒绝签发）。
@@ -2088,6 +2170,8 @@ def revoke_view_pass(
     post_commit_error: HTTPException | None = None
     result: dict[str, Any] | None = None
     with write_tx(db) as tx:
+        # 轮换先提交时旧密钥写入不得生效：锁内复核，失效则 401 并整体回滚
+        ensure_current_key(tx, user)
         # 与其他写路径一致：先确定性到点开封，再结算该资料的到期清除
         resolve_due_waiting(tx, now)
         purged_here = purge_due_documents(tx, now, vp["document_id"]) > 0
@@ -2232,6 +2316,8 @@ def mark_notification_read(
     """
     now = utc_str(now_utc())
     with write_tx(db) as tx:
+        # 轮换先提交时旧密钥写入不得生效：锁内复核，失效则 401 并整体回滚
+        ensure_current_key(tx, user)
         row = tx.execute(
             "SELECT * FROM notifications WHERE id = ?", (notification_id,)
         ).fetchone()
@@ -2297,6 +2383,8 @@ def issue_audit_snapshot(
 
     now = utc_str(now_utc())
     with write_tx(db) as tx:
+        # 轮换先提交时旧密钥写入不得生效：锁内复核，失效则 401 并整体回滚
+        ensure_current_key(tx, user)
         # 先完成到点开封/到期清除等确定性结算：快照只反映结算完成后的状态
         resolve_due_waiting(tx, now)
         purge_due_documents(tx, now)

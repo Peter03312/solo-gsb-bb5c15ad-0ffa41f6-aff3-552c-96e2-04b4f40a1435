@@ -18,6 +18,10 @@
 封存人可凭凭证编号在兑换前撤销。资料开封、到期清除、见证人替换与交接确认
 时，系统还会在状态变更的同一事务内向当时的封存人/见证人**投递站内通知**，
 账号凭现有 `X-API-Key` 以事件序号游标分页读取本人通知、按通知编号标记已读。
+账号持有人还可凭当前 `X-API-Key` **轮换密钥**：新密钥只在成功响应中返回一次，
+持久层只存摘要，旧密钥自轮换提交起失效（重启后仍然如此）；轮换与封存、
+见证同意、交接、清除安排等已认证写操作并发时按事务提交先后判定——轮换先
+提交则旧密钥写入不得生效或留下业务审计，业务写入先提交则照常完成。
 技术栈：Python 3.11 + FastAPI + SQLite。
 
 ## 安全与业务规则
@@ -25,6 +29,8 @@
 | 规则 | 实现方式 |
 | --- | --- |
 | 本地账号，凭密钥操作 | `POST /register` 返回一次性 API Key，请求头 `X-API-Key` 携带；服务端只存 SHA-256 哈希 |
+| 密钥轮换 | 账号持有人凭当前密钥 `POST /me/api-key/rotate`：新密钥仅在成功响应中返回一次，库内只存 SHA-256 摘要；旧密钥自轮换提交起失效（重启后仍然如此），再使用与无效凭据一样 `401`，不泄露账号存在性 |
+| 轮换与业务写并发 | 轮换与封存、见证同意、交接、清除安排等已认证写操作共用同一把写锁，按事务提交先后判定：每个已认证写事务进入临界区后先复核“本次认证所用密钥仍是当前密钥”——轮换先提交则旧密钥写入 `401` 回滚（不生效、不留业务审计），业务写入先提交则照常完成 |
 | 封存需三名不同见证人 | 封存时校验三人互异、均已注册、且不含封存人本人 |
 | 保存正文及摘要 | 正文原文与 SHA-256 摘要同表保存；封存后无任何更新接口，内容不可改 |
 | 开封前不泄露正文 | 封存/待开封状态下查询/列表/错误响应均不含 `body`；非参与方一律 `403`，不区分资料是否存在 |
@@ -151,6 +157,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | --- | --- | --- |
 | POST | `/register` | 注册，返回一次性 `api_key` |
 | GET | `/me` | 查询当前密钥对应的账号 |
+| POST | `/me/api-key/rotate` | 凭当前密钥轮换：返回一次性新 `api_key`，旧密钥自提交起失效 |
 | POST | `/documents` | 封存资料：`{body, witnesses:[3人]}`，返回 `digest`（无正文） |
 | GET | `/documents` | 列出本人封存/见证的资料（仅元数据，含 `purge_at`/`purged_at`） |
 | GET | `/documents/{id}` | 详情；开封后才含 `body`、`reason`、`witness_approvals`；已清除返回 `purged` 与清除时刻 |
@@ -711,6 +718,55 @@ curl -sS -X POST $BASE/audit-snapshots/verify \
 # 公钥换成别的有效 Ed25519 公钥 -> 400 签名不匹配（信任只来自事先信任的公钥）
 ```
 
+### 密钥轮换（API key rotation）
+
+账号持有人可凭**当前** `X-API-Key` 轮换密钥，无需任何请求体：
+
+- `POST /me/api-key/rotate`（需 `X-API-Key`）：生成新密钥并即时刻替换。
+  成功 `200`：
+
+  ```json
+  {
+    "user_id": 1,
+    "username": "alice",
+    "api_key": "a633…（64 位十六进制，仅此一次返回）",
+    "rotated_at": "2026-10-02T12:19:59.234447+00:00"
+  }
+  ```
+
+- **新密钥只返回这一次**：持久层只保存它的 SHA-256 摘要（`users.key_hash`），
+  服务端之后无法找回；`/me` 等任何接口都不再返回密钥。
+- **旧密钥自轮换提交起失效**：再使用与无效凭据一样返回 `401`
+  `{"detail": "凭据无效"}`，不泄露账号存在性；失效状态持久化于库中，
+  **重启后仍然如此**。可凭当前密钥再次轮换，上一把随即失效。
+- **并发按事务提交先后判定**：轮换与封存、见证同意、交接、清除安排等
+  已认证写操作共用同一把 `BEGIN IMMEDIATE` 写锁；每个已认证写事务进入
+  临界区后先复核“本次认证所用密钥仍是该账号当前密钥”——
+  - 轮换先提交：旧密钥的写操作以 `401` 拒绝并整体回滚，**写入不生效、
+    也不留业务审计**；
+  - 业务写入先提交：照常完成，轮换随后生效。
+- **未轮换账号与无凭据接口行为不变**：阅览兑换、快照验真、公钥查询等
+  无需登录的行为保持原样；轮换只影响本账号的密钥，不影响其资料、
+  见证人身份、通知收件箱等任何业务数据（账号身份跟账号不跟密钥）。
+- 轮换本身按顺序追加一条 `api_key_rotated` 审计记录（不关联任何资料）。
+
+```bash
+# 轮换（新密钥只显示这一次，请保存）
+curl -sS -X POST $BASE/me/api-key/rotate -H "X-API-Key: $OLD_KEY"
+# -> {"user_id":1,"username":"alice","api_key":"<新密钥>","rotated_at":"…"}
+
+# 旧密钥随即失效：与伪造密钥同样的 401，不泄露账号存在性
+curl -sS -o /dev/null -w '%{http_code}\n' $BASE/me -H "X-API-Key: $OLD_KEY"
+# -> 401
+
+# 新密钥立即可用，业务照常
+curl -sS $BASE/me -H "X-API-Key: $NEW_KEY"
+# -> {"user_id":1,"username":"alice"}
+```
+
+可运行的端到端示例：`python examples/demo_rotate_key.py`
+（默认 `http://127.0.0.1:8000`，可传入自定义地址）。
+
 ### 调用示例（curl）
 
 ```bash
@@ -768,6 +824,7 @@ python3 examples/demo_purge.py           # 到期清除：安排/改期/取消/�
 python3 examples/demo_audit_snapshot.py  # 审计快照：签发/验真/篡改失败/版本与公钥失败/交接后旧封存人禁签
 python3 examples/demo_view_pass.py       # 一次性阅览凭证：签发/无账号兑换一次/再兑换404/兑换前撤销
 python3 examples/demo_notifications.py   # 站内通知：开封/替换/交接/清除投递、游标分页、标记已读与拒绝场景
+python3 examples/demo_rotate_key.py      # 密钥轮换：新密钥仅返回一次、旧密钥即时失效、业务照常
 ```
 
 ### 典型拒绝场景
@@ -835,6 +892,14 @@ python -m pytest -q
 保留首次）、他人/不存在编号统一 `403` 不改状态、缺凭据 `401`、失去资料
 权限后仍可读并标记本人通知但不能借此访问资料，以及真实 uvicorn + 多线程的
 **多请求并发结算同一次到点清除**（每名参与方恰好一条 purged，不重复投递）。
+密钥轮换测试覆盖：凭当前密钥轮换（无凭据/错凭据 401）、新密钥仅成功响应
+返回一次且库内只存 SHA-256 摘要（冷读库校验）、旧密钥自提交起失效且重启后
+仍失效（与伪造密钥同一 401 文案）、可连续轮换、轮换留痕 `api_key_rotated`、
+未轮换账号与无凭据接口（公钥查询/快照验真/阅览兑换）行为不变、新密钥
+封存/开封/清除安排照常，以及真实 uvicorn + 多线程的**并发轮换 vs 封存、
+并发轮换 vs 见证同意、并发双轮换**（按事务提交先后判定：轮换先提交则旧
+密钥写入 401 且不留业务数据/审计，业务写入先提交则照常完成，双轮换只有
+先提交者生效）。
 
 ## 项目结构
 
@@ -845,11 +910,11 @@ app/
   schemas.py    # 请求模型（含带时区 deadline / earliest_open_at、替换见证人、交接邀请、清除时刻、阅览凭证、快照验真入参校验）
   ed25519.py    # Ed25519 签名（RFC 8032）纯标准库实现，无第三方依赖
   snapshots.py  # 审计快照：canonical-json-v1 规范化、签名密钥持久化、公钥 PEM/指纹、快照组装与签名
-  main.py       # FastAPI 路由、认证、定时开封+到期清除+过期扫描器、全部业务规则（见证人替换、封存人交接、到期清除、审计快照签发与验真、一次性阅览凭证签发/兑换/撤销、站内通知投递/游标分页/标记已读）
+  main.py       # FastAPI 路由、认证、密钥轮换、定时开封+到期清除+过期扫描器、全部业务规则（见证人替换、封存人交接、到期清除、审计快照签发与验真、一次性阅览凭证签发/兑换/撤销、站内通知投递/游标分页/标记已读）
 init_db.py      # 幂等初始化入口
 entrypoint.sh   # 容器入口（初始化 + uvicorn）
-examples/       # demo.sh / demo.py / demo_scheduled.py / demo_replace_witness.py / demo_handover.py / demo_purge.py / demo_audit_snapshot.py / demo_view_pass.py / demo_notifications.py 端到端示例
-tests/          # pytest 测试（功能、定时、替换见证人、交接、到期清除、审计快照、阅览凭证、站内通知、并发、重启）
+examples/       # demo.sh / demo.py / demo_scheduled.py / demo_replace_witness.py / demo_handover.py / demo_purge.py / demo_audit_snapshot.py / demo_view_pass.py / demo_notifications.py / demo_rotate_key.py 端到端示例
+tests/          # pytest 测试（功能、定时、替换见证人、交接、到期清除、审计快照、阅览凭证、站内通知、密钥轮换、并发、重启）
 Dockerfile
 docker-compose.yml
 ```

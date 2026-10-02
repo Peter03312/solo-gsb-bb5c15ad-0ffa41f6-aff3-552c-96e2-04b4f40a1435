@@ -56,6 +56,14 @@
   存在性，且拒绝路径不写任何记录；
 - 当前封存人凭凭证编号可在兑换前撤销（资料到清除时刻或被改期清除的同样拒绝）；
   签发、成功兑换、撤销均按顺序追加到原有 audit_log 审计链；
+- 账号持有人可凭当前 X-API-Key 轮换密钥：成功响应只返回一次新密钥明文，
+  持久层只保存新密钥的 SHA-256 摘要（与注册一致），旧密钥自轮换提交后立即
+  失效并随 WAL 持久化（重启后仍然失效）。轮换与封存、见证同意、交接、清除
+  安排等已认证写操作并发时，统一按 BEGIN IMMEDIATE 已提交先后判定：轮换先
+  提交，则持旧密钥的业务写入在其写锁内复核密钥时按既有 401 行为拒绝并随事务
+  回滚——既不生效，也不留下业务审计；业务写入先提交则照常完成，之后旧密钥
+  失效。无效或已失效密钥一律沿用现有 401（不区分账号是否存在，不留任何记录）；
+  未轮换账号以及无需登录的阅览兑换、快照验真行为完全保持原样。
 - 每次操作按顺序追加到 audit_log，SQLite 持久化，重启后状态一致。
 - 站内通知：资料开封（opened）或到期清除（purged）时，在状态变更的同一写
   事务内向“当时封存人 + 三名见证人”各记一条；见证人替换（witness_replaced）
@@ -77,8 +85,8 @@ import hashlib
 import os
 import secrets
 import sqlite3
-from contextlib import asynccontextmanager
-from typing import Any
+from contextlib import asynccontextmanager, contextmanager
+from typing import Any, Iterator
 
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
@@ -111,6 +119,32 @@ from .schemas import (
 
 def sha256_hex(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+class AuthUser:
+    """已认证账号：除 users 行字段外保留请求提交的 X-API-Key 明文。
+
+    明文只用于“写锁内二次复核”：进入已认证写事务后在 BEGIN IMMEDIATE 临界区
+    内重新比对当前 key_hash，判定该密钥是否已被并发提交的轮换作废；
+    绝不写库、不进审计、不随任何响应返回。行访问方式（["col"]、keys()）与
+    sqlite3.Row 完全一致，调用方无需改动。
+    """
+
+    def __init__(self, row: sqlite3.Row, presented_key: str) -> None:
+        self._row = row
+        self.presented_key = presented_key
+
+    def __getitem__(self, key: str) -> Any:
+        return self._row[key]
+
+    def keys(self) -> list[str]:
+        return self._row.keys()
+
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            return self._row[key]
+        except (IndexError, KeyError):
+            return default
 
 
 def add_audit(
@@ -442,10 +476,16 @@ def purge_due_documents(
     return len(rows)
 
 
-def settle_due_purges_for_read(db: sqlite3.Connection, document_id: int | None = None) -> None:
+def settle_due_purges_for_read(
+    db: sqlite3.Connection,
+    document_id: int | None = None,
+    user: AuthUser | None = None,
+) -> None:
     """读路径的确定性到点清除：仅当存在到点未清除的资料时才进入写事务。
 
     保证“到期后查询也呈现已清除结果”，同时不改变未清除资料的只读行为。
+    若提供已认证账号，则清除写入同样要在写锁内复核密钥：密钥已被轮换提交的
+    请求不得借读路径产生任何写入（扫描器与后续合法请求会照常完成结算）。
     """
     now = utc_str(now_utc())
     if document_id is not None:
@@ -465,6 +505,8 @@ def settle_due_purges_for_read(db: sqlite3.Connection, document_id: int | None =
     if due is None:
         return
     with write_tx(db) as tx:
+        if user is not None and not key_still_valid(tx, user):
+            raise err(401, "凭据无效")
         purge_due_documents(tx, utc_str(now_utc()), document_id)
 
 
@@ -589,7 +631,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="双人见证资料封存服务",
-    version="1.8.0",
+    version="1.9.0",
     lifespan=lifespan,
 )
 
@@ -625,7 +667,7 @@ def get_db():
 def current_user(
     x_api_key: str | None = Header(default=None),
     db: sqlite3.Connection = Depends(get_db),
-) -> sqlite3.Row:
+) -> AuthUser:
     if not x_api_key:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="缺少 API Key")
     row = db.execute(
@@ -633,7 +675,36 @@ def current_user(
     ).fetchone()
     if row is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="凭据无效")
-    return row
+    return AuthUser(row, x_api_key)
+
+
+def key_still_valid(tx: sqlite3.Connection, user: AuthUser) -> bool:
+    """在已持有的写锁内复核请求密钥是否仍是该账号当前密钥。
+
+    密钥轮换与业务写事务经 BEGIN IMMEDIATE 串行化：本函数读取到的
+    key_hash 即“本事务提交顺序下”的最新值。旧密钥在轮换提交后进入的
+    任何已认证写事务都会得到 False，由调用方按既有 401 行为拒绝并回滚。
+    """
+    current = tx.execute(
+        "SELECT key_hash FROM users WHERE id = ?", (user["id"],)
+    ).fetchone()
+    return current is not None and current["key_hash"] == sha256_hex(user.presented_key)
+
+
+@contextmanager
+def authed_write_tx(db: sqlite3.Connection, user: AuthUser) -> Iterator[sqlite3.Connection]:
+    """已认证业务写操作专用事务：BEGIN IMMEDIATE 取锁后先复核密钥。
+
+    - 复核发生在任何业务检查/写入与审计之前：密钥若已被先提交的轮换作废，
+      立即按既有 401 行为拒绝并整体回滚，业务写入不生效、不留业务审计，
+      也不触发到点开封/清除等连带结算（结算由扫描器与后续合法请求完成）；
+    - 密钥仍有效时与普通 write_tx 等价；业务校验在锁内失败仍按原规则回滚，
+      行为与引入轮换前完全一致。
+    """
+    with write_tx(db) as tx:
+        if not key_still_valid(tx, user):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="凭据无效")
+        yield tx
 
 
 def err(status_code: int, message: str) -> HTTPException:
@@ -664,8 +735,47 @@ def register(payload: RegisterIn, db: sqlite3.Connection = Depends(get_db)) -> d
 
 
 @app.get("/me")
-def me(user: sqlite3.Row = Depends(current_user)) -> dict[str, Any]:
+def me(user: AuthUser = Depends(current_user)) -> dict[str, Any]:
     return {"user_id": user["id"], "username": user["username"]}
+
+
+@app.post("/me/api-key/rotate")
+def rotate_api_key(
+    db: sqlite3.Connection = Depends(get_db),
+    user: AuthUser = Depends(current_user),
+) -> dict[str, Any]:
+    """账号持有人凭当前 X-API-Key 轮换密钥。
+
+    - 新密钥为 256 位随机串，明文只在本次响应返回一次，服务端之后无法找回；
+      持久层仅保存其 SHA-256 摘要（旧摘要被覆盖，不保留历史密钥）；
+    - 事务一旦提交，旧密钥立即失效（WAL 持久化，重启后仍然失效）；
+    - 与其他已认证写操作共用同一把 BEGIN IMMEDIATE 写锁：轮换先提交则并发的
+      旧密钥业务写一律 401 回滚；业务写先提交则该业务写照常完成，本次轮换
+      随后提交。无效/缺失凭据沿用既有 401（不区分账号是否存在，不留记录）。
+    """
+    new_api_key = secrets.token_hex(32)
+    now = utc_str(now_utc())
+    with authed_write_tx(db, user) as tx:
+        # 锁内复核（authed_write_tx 已做一次；此处条件更新同时保证只更新本人行）
+        cur = tx.execute(
+            "UPDATE users SET key_hash = ? WHERE id = ? AND key_hash = ?",
+            (sha256_hex(new_api_key), user["id"], sha256_hex(user.presented_key)),
+        )
+        if cur.rowcount != 1:
+            # 理论不可达：复核刚通过；保持与既有 401 完全一致的失败语义
+            raise err(401, "凭据无效")
+        add_audit(
+            tx,
+            actor_id=user["id"],
+            action="api_key_rotated",
+            detail="账号 API Key 已轮换：旧密钥即刻失效，库内仅保存新密钥摘要，明文未持久化",
+        )
+    return {
+        "user_id": user["id"],
+        "username": user["username"],
+        "api_key": new_api_key,
+        "rotated_at": now,
+    }
 
 
 @app.get("/health")
@@ -682,14 +792,14 @@ def health() -> dict[str, str]:
 def seal_document(
     payload: SealIn,
     db: sqlite3.Connection = Depends(get_db),
-    user: sqlite3.Row = Depends(current_user),
+    user: AuthUser = Depends(current_user),
 ) -> dict[str, Any]:
     if len(set(payload.witnesses)) != 3:
         raise err(400, "必须指定三名互不相同的见证人")
     if user["username"] in payload.witnesses:
         raise err(400, "封存人不能同时担任见证人")
 
-    with write_tx(db) as tx:
+    with authed_write_tx(db, user) as tx:
         placeholders = ",".join("?" for _ in payload.witnesses)
         witness_rows = tx.execute(
             f"SELECT id, username FROM users WHERE username IN ({placeholders})",
@@ -727,7 +837,7 @@ def seal_document(
 
 
 def load_doc_for_participant(
-    db: sqlite3.Connection, doc_id: int, user: sqlite3.Row
+    db: sqlite3.Connection, doc_id: int, user: AuthUser
 ) -> sqlite3.Row:
     """取资料并校验参与方（封存人或指定见证人）；否则统一 403，不区分是否存在。"""
     doc = db.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
@@ -747,13 +857,13 @@ def load_doc_for_participant(
 @app.get("/documents")
 def list_documents(
     db: sqlite3.Connection = Depends(get_db),
-    user: sqlite3.Row = Depends(current_user),
+    user: AuthUser = Depends(current_user),
 ) -> dict[str, Any]:
     """仅列出本人封存或本人见证的资料（只有元数据，永不返回正文）。
 
     到清除时刻的资料在查询前被确定性清除（purged），列表呈现已清除状态。
     """
-    settle_due_purges_for_read(db)
+    settle_due_purges_for_read(db, user=user)
     rows = db.execute(
         """
         SELECT DISTINCT d.id, d.status, d.created_at, d.opened_at, d.purge_at, d.purged_at
@@ -784,14 +894,14 @@ def _open_request_meta(req: sqlite3.Row) -> dict[str, Any]:
 def get_document(
     doc_id: int,
     db: sqlite3.Connection = Depends(get_db),
-    user: sqlite3.Row = Depends(current_user),
+    user: AuthUser = Depends(current_user),
 ) -> dict[str, Any]:
     """查询资料。开封前不含正文；开封后返回正文、摘要、理由与见证记录。
 
     已到清除时刻的资料先被确定性清除：返回 purged 状态与清除时刻，
     保留摘要、参与方与审计元数据，正文永不返回。除此之外只读，不改状态。
     """
-    settle_due_purges_for_read(db, doc_id)
+    settle_due_purges_for_read(db, doc_id, user)
     doc = load_doc_for_participant(db, doc_id, user)
 
     witnesses = [
@@ -875,7 +985,7 @@ def create_open_request(
     doc_id: int,
     payload: OpenRequestIn,
     db: sqlite3.Connection = Depends(get_db),
-    user: sqlite3.Row = Depends(current_user),
+    user: AuthUser = Depends(current_user),
 ) -> dict[str, Any]:
     doc = load_doc_for_participant(db, doc_id, user)
     if doc["owner_id"] != user["id"]:
@@ -892,7 +1002,7 @@ def create_open_request(
     # 清除若在本临界区内生效，清除先落库，拒绝在提交后再返回（与同意/撤销一致）
     post_commit_error: HTTPException | None = None
     request_id: int | None = None
-    with write_tx(db) as tx:
+    with authed_write_tx(db, user) as tx:
         # 锁内先处理到点的定时开封与到期清除，避免与同意/撤销/扫描并发
         resolve_due_waiting(tx, now)
         purge_due_documents(tx, now)
@@ -959,7 +1069,7 @@ def approve_open_request(
     request_id: int,
     payload: ApproveIn,
     db: sqlite3.Connection = Depends(get_db),
-    user: sqlite3.Row = Depends(current_user),
+    user: AuthUser = Depends(current_user),
 ) -> dict[str, Any]:
     """见证人同意：必须是该资料的三名指定见证人之一；摘要须与封存摘要一致。
 
@@ -987,7 +1097,7 @@ def approve_open_request(
     post_commit_error: HTTPException | None = None
     response: dict[str, Any] | None = None
     try:
-        with write_tx(db) as tx:
+        with authed_write_tx(db, user) as tx:
             # 临界区第一步：到点的 waiting 请求必开封、到清除时刻的资料必清除；
             # 之后任何状态判定都以此为准，因此定时处理即使被后台延迟，
             # 也不会被并发同意/撤销/扫描作废。
@@ -1106,7 +1216,7 @@ def revoke_open_request(
     request_id: int,
     payload: RevokeIn,
     db: sqlite3.Connection = Depends(get_db),
-    user: sqlite3.Row = Depends(current_user),
+    user: AuthUser = Depends(current_user),
 ) -> dict[str, Any]:
     meta = db.execute(
         """SELECT r.id, r.document_id, r.status, r.deadline, d.owner_id
@@ -1123,7 +1233,7 @@ def revoke_open_request(
     # 与同意相同：到点开封/到期清除先提交，拒绝（撤销已随开封/清除失效的请求）
     # 在提交后再返回。
     post_commit_error: HTTPException | None = None
-    with write_tx(db) as tx:
+    with authed_write_tx(db, user) as tx:
         due_opened = resolve_due_waiting(tx, now, request_id) > 0
         purged_here = purge_due_documents(tx, now, meta["document_id"]) > 0
         req = tx.execute("SELECT * FROM open_requests WHERE id = ?", (request_id,)).fetchone()
@@ -1177,7 +1287,7 @@ def replace_witness(
     doc_id: int,
     payload: ReplaceWitnessIn,
     db: sqlite3.Connection = Depends(get_db),
-    user: sqlite3.Row = Depends(current_user),
+    user: AuthUser = Depends(current_user),
 ) -> dict[str, Any]:
     doc = load_doc_for_participant(db, doc_id, user)
     if doc["owner_id"] != user["id"]:
@@ -1186,7 +1296,7 @@ def replace_witness(
     now = utc_str(now_utc())
     post_commit_error: HTTPException | None = None
     result: dict[str, Any] = {}
-    with write_tx(db) as tx:
+    with authed_write_tx(db, user) as tx:
         # 临界区第一步与其他写路径一致：先确定性到点开封与到期清除。
         # 用全局解析：与扫描器等价，顺带把已到点的 waiting 请求开封、
         # 到清除时刻的资料清除。
@@ -1401,7 +1511,7 @@ def create_handover_invitation(
     doc_id: int,
     payload: HandoverIn,
     db: sqlite3.Connection = Depends(get_db),
-    user: sqlite3.Row = Depends(current_user),
+    user: AuthUser = Depends(current_user),
 ) -> dict[str, Any]:
     doc = load_doc_for_participant(db, doc_id, user)
     if doc["owner_id"] != user["id"]:
@@ -1415,7 +1525,7 @@ def create_handover_invitation(
     post_commit_error: HTTPException | None = None
     invitation: dict[str, Any] | None = None
     try:
-        with write_tx(db) as tx:
+        with authed_write_tx(db, user) as tx:
             # 临界区第一步与其他写路径一致：先确定性到点开封与到期清除
             # （开封/清除会连带使既有待确认邀请失效，必须先落库）。
             resolve_due_waiting(tx, now)
@@ -1487,7 +1597,7 @@ def create_handover_invitation(
 
 
 def _load_invitation_for_owner(
-    db: sqlite3.Connection, invitation_id: int, user: sqlite3.Row
+    db: sqlite3.Connection, invitation_id: int, user: AuthUser
 ) -> sqlite3.Row:
     """取邀请并校验“当前封存人”身份；其他情况统一 403，不区分是否存在。"""
     inv = db.execute(
@@ -1507,7 +1617,7 @@ def _load_invitation_for_owner(
 def revoke_handover_invitation(
     invitation_id: int,
     db: sqlite3.Connection = Depends(get_db),
-    user: sqlite3.Row = Depends(current_user),
+    user: AuthUser = Depends(current_user),
 ) -> dict[str, Any]:
     _load_invitation_for_owner(db, invitation_id, user)
 
@@ -1516,7 +1626,7 @@ def revoke_handover_invitation(
     # 状态变更先提交，撤回失败在提交后再返回。
     post_commit_error: HTTPException | None = None
     invitation: dict[str, Any] | None = None
-    with write_tx(db) as tx:
+    with authed_write_tx(db, user) as tx:
         resolve_due_waiting(tx, now)
         purge_due_documents(tx, now)
         expired_here = expire_due_invitations(tx, now, invitation_id) > 0
@@ -1566,7 +1676,7 @@ def revoke_handover_invitation(
 def confirm_handover(
     invitation_id: int,
     db: sqlite3.Connection = Depends(get_db),
-    user: sqlite3.Row = Depends(current_user),
+    user: AuthUser = Depends(current_user),
 ) -> dict[str, Any]:
     """受让人凭本人 X-API-Key 在截止前确认交接。
 
@@ -1585,7 +1695,7 @@ def confirm_handover(
     now = utc_str(now_utc())
     post_commit_error: HTTPException | None = None
     response: dict[str, Any] | None = None
-    with write_tx(db) as tx:
+    with authed_write_tx(db, user) as tx:
         # 结算顺序第 1 步：到点开封 / 到期清除 / 邀请逾期全部确定性落库。
         resolve_due_waiting(tx, now)
         purge_due_documents(tx, now)
@@ -1750,7 +1860,7 @@ def confirm_handover(
 def get_handover_invitation(
     invitation_id: int,
     db: sqlite3.Connection = Depends(get_db),
-    user: sqlite3.Row = Depends(current_user),
+    user: AuthUser = Depends(current_user),
 ) -> dict[str, Any]:
     """查询邀请状态：邀请双方或该资料当前参与方（封存人/见证人）可见；只含元数据。
 
@@ -1761,7 +1871,7 @@ def get_handover_invitation(
     ).fetchone()
     if inv is None:
         raise err(403, "无权操作该邀请或邀请不存在")
-    settle_due_purges_for_read(db, inv["document_id"])
+    settle_due_purges_for_read(db, inv["document_id"], user)
     inv = db.execute(
         "SELECT * FROM handover_invitations WHERE id = ?", (invitation_id,)
     ).fetchone()
@@ -1798,7 +1908,7 @@ def schedule_purge(
     doc_id: int,
     payload: PurgeIn,
     db: sqlite3.Connection = Depends(get_db),
-    user: sqlite3.Row = Depends(current_user),
+    user: AuthUser = Depends(current_user),
 ) -> dict[str, Any]:
     """安排或改期到期清除时刻。已开封资料同样可安排（到点照常清除正文）。"""
     doc = load_doc_for_participant(db, doc_id, user)
@@ -1812,7 +1922,7 @@ def schedule_purge(
 
     post_commit_error: HTTPException | None = None
     result: dict[str, Any] | None = None
-    with write_tx(db) as tx:
+    with authed_write_tx(db, user) as tx:
         # 临界区第一步与其他写路径一致：先确定性到点开封与到期清除。
         # 清除时刻已到的资料在此生效（purged），随后的改期请求随即被拒。
         resolve_due_waiting(tx, now)
@@ -1860,7 +1970,7 @@ def schedule_purge(
 def cancel_purge(
     doc_id: int,
     db: sqlite3.Connection = Depends(get_db),
-    user: sqlite3.Row = Depends(current_user),
+    user: AuthUser = Depends(current_user),
 ) -> dict[str, Any]:
     """在清除时刻到来前取消已安排的到期清除。"""
     doc = load_doc_for_participant(db, doc_id, user)
@@ -1870,7 +1980,7 @@ def cancel_purge(
     now = utc_str(now_utc())
     post_commit_error: HTTPException | None = None
     result: dict[str, Any] | None = None
-    with write_tx(db) as tx:
+    with authed_write_tx(db, user) as tx:
         # 与改期相同：先确定性到点开封与到期清除；清除时刻已到的资料在此
         # 生效，取消请求随即被拒（已到期不能取消）。
         resolve_due_waiting(tx, now)
@@ -1929,7 +2039,7 @@ def issue_view_pass(
     doc_id: int,
     payload: ViewPassIn,
     db: sqlite3.Connection = Depends(get_db),
-    user: sqlite3.Row = Depends(current_user),
+    user: AuthUser = Depends(current_user),
 ) -> dict[str, Any]:
     """封存人为已开封资料签发一次性阅览凭证。"""
     doc = load_doc_for_participant(db, doc_id, user)
@@ -1943,7 +2053,7 @@ def issue_view_pass(
 
     post_commit_error: HTTPException | None = None
     result: dict[str, Any] | None = None
-    with write_tx(db) as tx:
+    with authed_write_tx(db, user) as tx:
         # 临界区第一步与其他写路径一致：先确定性到点开封，再结算到期清除，
         # 避免签发与定时开封/清除赛跑（同刻时清除优先由 resolve_due_waiting
         # 的 purge_at 比较保证；清除若在本临界区生效，先提交，再拒绝签发）。
@@ -2074,7 +2184,7 @@ def redeem_view_pass(
 def revoke_view_pass(
     pass_id: int,
     db: sqlite3.Connection = Depends(get_db),
-    user: sqlite3.Row = Depends(current_user),
+    user: AuthUser = Depends(current_user),
 ) -> dict[str, Any]:
     """当前封存人凭凭证编号在兑换前撤销一次性阅览凭证。"""
     vp = db.execute("SELECT * FROM view_passes WHERE id = ?", (pass_id,)).fetchone()
@@ -2087,7 +2197,7 @@ def revoke_view_pass(
     now = utc_str(now_utc())
     post_commit_error: HTTPException | None = None
     result: dict[str, Any] | None = None
-    with write_tx(db) as tx:
+    with authed_write_tx(db, user) as tx:
         # 与其他写路径一致：先确定性到点开封，再结算该资料的到期清除
         resolve_due_waiting(tx, now)
         purged_here = purge_due_documents(tx, now, vp["document_id"]) > 0
@@ -2141,10 +2251,10 @@ def revoke_view_pass(
 def get_audit(
     doc_id: int,
     db: sqlite3.Connection = Depends(get_db),
-    user: sqlite3.Row = Depends(current_user),
+    user: AuthUser = Depends(current_user),
 ) -> dict[str, Any]:
     # 到清除时刻的资料先确定性清除，审计随即包含 purged 记录
-    settle_due_purges_for_read(db, doc_id)
+    settle_due_purges_for_read(db, doc_id, user)
     load_doc_for_participant(db, doc_id, user)
     rows = db.execute(
         """SELECT a.id, a.at, a.action, a.request_id, a.detail,
@@ -2196,7 +2306,7 @@ def list_notifications(
         default=20, ge=1, le=100, alias="page_size", description="页大小（1～100）"
     ),
     db: sqlite3.Connection = Depends(get_db),
-    user: sqlite3.Row = Depends(current_user),
+    user: AuthUser = Depends(current_user),
 ) -> dict[str, Any]:
     """读取本人通知：按事件序号升序，非负游标分页，返回通知与下一游标。
 
@@ -2222,7 +2332,7 @@ def list_notifications(
 def mark_notification_read(
     notification_id: int,
     db: sqlite3.Connection = Depends(get_db),
-    user: sqlite3.Row = Depends(current_user),
+    user: AuthUser = Depends(current_user),
 ) -> dict[str, Any]:
     """把本人的一条通知标记已读并返回已读状态。
 
@@ -2231,7 +2341,7 @@ def mark_notification_read(
     read_at，不产生额外记录，也不写审计。
     """
     now = utc_str(now_utc())
-    with write_tx(db) as tx:
+    with authed_write_tx(db, user) as tx:
         row = tx.execute(
             "SELECT * FROM notifications WHERE id = ?", (notification_id,)
         ).fetchone()
@@ -2285,7 +2395,7 @@ def ensure_signing_key() -> None:
 def issue_audit_snapshot(
     doc_id: int,
     db: sqlite3.Connection = Depends(get_db),
-    user: sqlite3.Row = Depends(current_user),
+    user: AuthUser = Depends(current_user),
 ) -> dict[str, Any]:
     """签发审计快照：仅当前封存人或当前指定见证人；其他情况统一 403。
 
@@ -2296,7 +2406,7 @@ def issue_audit_snapshot(
     load_doc_for_participant(db, doc_id, user)
 
     now = utc_str(now_utc())
-    with write_tx(db) as tx:
+    with authed_write_tx(db, user) as tx:
         # 先完成到点开封/到期清除等确定性结算：快照只反映结算完成后的状态
         resolve_due_waiting(tx, now)
         purge_due_documents(tx, now)
